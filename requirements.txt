@@ -1,0 +1,14 @@
+# StudyRAG - Step 1.1 Core Foundation Dependencies
+streamlit>=1.35.0
+pydantic>=2.7.0
+python-dotenv>=1.0.0
+pytest>=8.0.0
+
+# StudyRAG - Step 2.1 Document Extraction Dependencies
+PyMuPDF>=1.24.0
+python-pptx>=1.0.0
+python-docx>=1.1.0
+
+# StudyRAG - Step 2.2 Local Embeddings & Vector Search
+chromadb>=1.5.0
+sentence-transformers>=6.0.0

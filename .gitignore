@@ -1,0 +1,47 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Configuration & Secrets
+.env
+.env.local
+.streamlit/secrets.toml
+
+# StudyRAG Application data, logs & local databases
+.studyrag/
+studyrag.db
+*.db
+*.sqlite
+*.sqlite3
+chroma/
+.chroma/
+*.log
+app.log
+data/
+output/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
