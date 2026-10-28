@@ -58,6 +58,9 @@ __all__ = [
     "update_file_indexing_status",
     "get_vector_index_counts",
     "get_chunk_with_metadata",
+    "get_distinct_senders",
+    "get_date_bounds",
+    "get_files_whatsapp_context",
 ]
 
 
@@ -1110,3 +1113,99 @@ def get_chunk_with_metadata(
         )
         return cursor.fetchone()
 
+
+def get_distinct_senders(
+    group_id: int | None = None,
+    db_path: Path | str | None = None,
+) -> list[str]:
+    """Retrieve sorted list of distinct non-empty senders across files and attachment_refs."""
+    with db_session(db_path) as conn:
+        cursor = conn.cursor()
+        query = """
+        SELECT DISTINCT sender FROM (
+            SELECT sender FROM files WHERE sender IS NOT NULL AND TRIM(sender) != ''
+            AND (? IS NULL OR group_id = ?)
+            UNION
+            SELECT sender FROM attachment_refs WHERE sender IS NOT NULL AND TRIM(sender) != ''
+            AND (? IS NULL OR group_id = ?)
+            UNION
+            SELECT name AS sender FROM senders WHERE name IS NOT NULL AND TRIM(name) != ''
+            AND (? IS NULL OR group_id = ?)
+        ) ORDER BY sender COLLATE NOCASE ASC;
+        """
+        cursor.execute(query, (group_id, group_id, group_id, group_id, group_id, group_id))
+        rows = cursor.fetchall()
+        return [str(r[0]) for r in rows if r[0]]
+
+
+def get_date_bounds(
+    group_id: int | None = None,
+    db_path: Path | str | None = None,
+) -> tuple[str | None, str | None]:
+    """Retrieve minimum and maximum message timestamps for a group or all groups."""
+    with db_session(db_path) as conn:
+        cursor = conn.cursor()
+        query = """
+        SELECT MIN(sent_at), MAX(sent_at) FROM (
+            SELECT sent_at FROM files WHERE sent_at IS NOT NULL AND TRIM(sent_at) != ''
+            AND (? IS NULL OR group_id = ?)
+            UNION ALL
+            SELECT sent_at FROM attachment_refs WHERE sent_at IS NOT NULL AND TRIM(sent_at) != ''
+            AND (? IS NULL OR group_id = ?)
+        );
+        """
+        cursor.execute(query, (group_id, group_id, group_id, group_id))
+        row = cursor.fetchone()
+        if row and row[0] and row[1]:
+            return str(row[0]), str(row[1])
+        return None, None
+
+
+def get_files_whatsapp_context(
+    file_ids: list[int],
+    db_path: Path | str | None = None,
+) -> list[sqlite3.Row]:
+    """Retrieve joined file and attachment_refs metadata for a list of file IDs.
+
+    Args:
+        file_ids: List of integer file IDs to inspect.
+        db_path: Optional custom SQLite database path.
+
+    Returns:
+        List of sqlite3.Row records with joined file, group, and attachment reference data.
+    """
+    if not file_ids:
+        return []
+
+    clean_ids = [int(fid) for fid in file_ids]
+    placeholders = ",".join("?" for _ in clean_ids)
+
+    query = f"""
+    SELECT
+        f.id AS file_id,
+        f.filename AS file_filename,
+        f.ext AS file_ext,
+        f.group_id AS file_group_id,
+        g.name AS group_name,
+        f.sender AS file_sender,
+        f.sent_at AS file_sent_at,
+        f.caption AS file_caption,
+        ar.id AS ref_id,
+        ar.sender AS ref_sender,
+        ar.sent_at AS ref_sent_at,
+        ar.caption AS ref_caption,
+        ar.context AS ref_context,
+        ar.original_filename AS ref_original_filename,
+        ar.status AS ref_status,
+        ar.resolution_method AS ref_resolution_method
+    FROM files f
+    JOIN groups g ON f.group_id = g.id
+    LEFT JOIN attachment_refs ar ON ar.file_id = f.id
+    WHERE f.id IN ({placeholders})
+    ORDER BY f.id ASC, ar.id ASC;
+    """
+
+    with db_session(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(query, tuple(clean_ids))
+        return cursor.fetchall()

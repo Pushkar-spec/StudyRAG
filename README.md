@@ -35,7 +35,14 @@
   - Incremental, idempotent vector synchronization with SHA-256 content-hash invalidation and `vector_index_state` tracking.
   - Unified hybrid candidate retrieval combining SQLite FTS5 lexical matching and ChromaDB semantic search with deduplication, search origin tagging (`keyword`, `semantic`, `both`), and independent score preservation.
   - Graceful fallback: If ChromaDB or embedding model fails, search automatically falls back to SQLite FTS5 keyword retrieval.
-- **Modular Streamlit Interface:** Modern dark-mode UI with foundation diagnostics, ingestion pipeline, attachment recovery review, document extraction controls, and interactive vector indexing & hybrid search tester.
+- **Local Cross-Encoder Reranking & Document-Level Ranking (Step 3.2):**
+  - High-precision cross-encoder reranking using **Sentence Transformers** (`BAAI/bge-reranker-base`).
+  - Lazy loading singleton (`LocalRerankerManager`) with local cache in `~/.cache/huggingface/hub/`.
+  - Joint query-passage attention scoring with strict preservation of original chunk metadata and retrieval signals.
+  - Bounded, non-inflationary document-level score aggregation with near-duplicate suppression.
+  - Returns ranked documents with traceable supporting chunks, source locations (pages/slides), and short excerpts.
+  - Transparent fallback: Preserves hybrid candidate ranking if the cross-encoder is disabled or fails.
+- **Modular Streamlit Interface:** Modern dark-mode UI with foundation diagnostics, ingestion pipeline, attachment recovery review, document extraction controls, interactive vector indexing, and hybrid & ranked document search.
 
 ---
 
@@ -43,7 +50,7 @@
 
 ```text
 StudyRAG/
-├── app.py                  # Streamlit entry point (ingestion, recovery, extraction & hybrid search)
+├── app.py                  # Streamlit entry point (ingestion, recovery, extraction & search)
 ├── requirements.txt        # Dependencies (PyMuPDF, python-pptx, python-docx, chromadb, sentence-transformers)
 ├── .env.example            # Template for environment variables and secrets
 ├── .gitignore              # Repository exclusions (caches, logs, DBs, venv)
@@ -51,12 +58,14 @@ StudyRAG/
 ├── DECISIONS.md            # Architecture & design decisions record
 ├── core/
 │   ├── __init__.py
-│   ├── config.py           # Pydantic v2 settings & path resolution (includes resolved_chroma_dir)
+│   ├── config.py           # Pydantic v2 settings & path resolution
 │   ├── db.py               # SQLite schema, FTS5 virtual tables, vector_index_state & DB operations
 │   ├── chat_parser.py      # WhatsApp Android/iOS chat parser & timestamp normalizer
 │   ├── ingest.py           # Ingestion pipeline, attachment tracking & recovery workflow
 │   ├── extraction.py       # Document text extraction (PDF, PPTX, DOCX) & chunking pipeline
-│   └── vector_store.py     # Local embeddings, ChromaDB collection & hybrid retrieval
+│   ├── vector_store.py     # Local embeddings, ChromaDB collection & hybrid retrieval
+│   ├── reranker.py         # Local cross-encoder reranker (BAAI/bge-reranker-base)
+│   └── document_ranking.py # Document-level aggregation & end-to-end ranking orchestrator
 ├── tests/
 │   ├── __init__.py
 │   ├── test_config.py      # Unit tests for settings validation & persistence
@@ -66,6 +75,8 @@ StudyRAG/
 │   ├── test_recovery.py    # Unit tests for missing attachment tracking & recovery
 │   ├── test_extraction.py  # Unit tests for PDF, PPTX, DOCX extraction & chunking
 │   ├── test_vector_store.py# Unit tests for ChromaDB, incremental embeddings & hybrid search
+│   ├── test_reranker.py    # Unit tests for cross-encoder reranking & pair construction
+│   ├── test_document_ranking.py # Tests for document aggregation & end-to-end orchestrator
 │   └── test_ui.py          # Streamlit UI AppTest and count reconciliation tests
 └── .streamlit/
     └── config.toml         # Streamlit server config (2000 MB upload limit)
@@ -259,23 +270,119 @@ StudyRAG couples lexical keyword search (SQLite FTS5) with semantic vector searc
 6. **Graceful Degradation / Fallback:**
    - If ChromaDB is uninitialized, corrupted, or Sentence Transformers fails to load, StudyRAG automatically falls back to SQLite FTS5 keyword retrieval with diagnostic warnings in the logs. Keyword search remains fully operational at all times.
 
-### Manual Verification with the Real Model
-In the automated test suite, deterministic mock embeddings are used to avoid downloading model weights. To verify with the real `BAAI/bge-small-en-v1.5` model:
-1. Ensure `sentence-transformers` and `chromadb` are installed: `pip install -r requirements.txt`.
-2. Launch the Streamlit dashboard: `streamlit run app.py`.
-3. In the **Vector Indexing & Semantic Search (Step 2.2)** section, click **Generate Embeddings & Index Pending Chunks**.
-4. Test queries in the **Hybrid Candidate Search Tester** with both exact keywords and conceptual paraphrases.
+---
 
+## Local Cross-Encoder Reranking & Document-Level Ranking (Step 3.2)
+
+### Bi-Encoder Embeddings vs Cross-Encoder Reranking
+
+| Aspect | Bi-Encoder (`BAAI/bge-small-en-v1.5`) | Cross-Encoder (`BAAI/bge-reranker-base`) |
+|---|---|---|
+| **Role** | Broad candidate retrieval (top 20–50 chunks). | High-precision candidate reranking & scoring. |
+| **Architecture** | Encodes query and passages into independent dense vectors. | Encodes query and passage jointly via self-attention: `CrossEncoder([query, text])`. |
+| **Speed & Scalability** | Sub-millisecond vector similarity search across thousands of chunks. | Higher computational cost; ideal for reranking top hybrid candidates. |
+| **Semantic Nuance** | Captures general topical similarity. | Resolves subtle term dependencies, negation, and direct relevance. |
+
+### Local Model Caching & Lifecycle
+- **Offline Inference:** The cross-encoder runs strictly locally via `sentence-transformers.CrossEncoder`. No external API keys or remote inference calls are ever made.
+- **Cache Location:** Automatically downloaded from Hugging Face hub on first use and cached in `~/.cache/huggingface/hub/models--BAAI--bge-reranker-base`.
+- **Lazy Loading Singleton:** Managed by `LocalRerankerManager`. The model is instantiated only when a search request requires it and remains in memory across subsequent Streamlit queries.
+- **Device Support:** Automatically selects `cuda` if compatible; falls back cleanly to `cpu`. Configurable via `rerank_device`.
+
+### Document-Level Bounded Score Aggregation
+Candidate chunks are grouped by original `file_id`. The document-level relevance score is computed as:
+$$\text{Document Score} = s_1 + \sum_{i=2}^{\min(N, 4)} w_i \cdot \max(0.0, s_i)$$
+
+- **Primary Anchor ($s_1$):** The highest reranker score among chunks from the document.
+- **Bounded Bonus ($s_2, s_3, s_4$):** Up to 3 additional distinct chunks contribute with diminishing weights $w = [0.10, 0.05, 0.02]$.
+- **Near-Duplicate Suppression:** Chunks with $\ge 60\%$ word overlap (Jaccard similarity) are treated as redundant and award zero bonus, preventing repeated boilerplate from inflating scores.
+- **Non-Inflationary Guarantee:** A 100-page document with many marginal chunks cannot outrank a focused 2-page document with a highly relevant chunk.
+
+### Understanding Reranker Scores
+- **Relative Relevance Logits:** Cross-encoder scores are raw uncalibrated model logits (e.g. ranging from negative values up to $+10$ or higher).
+- **Not Probabilities:** Scores are displayed as **Model Score**, not percentages or confidence probabilities. They indicate relative ranking priority among candidates.
+
+### Graceful Fallback Strategy
+If the cross-encoder is disabled (`disable_reranker=True`), encounters an initialization issue, or fails during inference:
+1. The hybrid candidate chunks from SQLite FTS5 and ChromaDB are preserved.
+2. Documents are ranked deterministically by retrieval signals (`both` consensus hits first, followed by highest semantic similarity or lexical rank).
+3. The UI flags the results with `is_reranked = False` and displays transparent diagnostic messages explaining the fallback reason.
+
+---
+
+## WhatsApp Context Retrieval & Filtering (Phase 4, Step 4.1)
+
+### Conversational Provenance for Academic Documents
+In collaborative WhatsApp study groups, lecture notes, syllabus drafts, and problem sets are distributed alongside conversational messages from instructors or peers (e.g. *"Here are the updated slides for tomorrow's midterm"*). Step 4.1 extracts and links this conversational provenance to ranked search results.
+
+### Features
+1. **Direct Sharing Message & Surrounding Context:**
+   - **Sharing Message:** The exact message accompanying the attachment (`caption`).
+   - **Surrounding Conversation:** A bounded 5-minute conversational window (up to 3 preceding messages from the sender) capturing context, instructions, or exam warnings.
+   - **Provenance Tracking:** Shows original filename, resolution status (`available`, `ambiguous`, `missing`), and resolution method (`direct`, `sha256`, `filename`, `manual`).
+2. **Context-Aware Metadata Filtering:**
+   - **Group Filter:** Filter results by one or more WhatsApp study groups.
+   - **Sender Filter:** Restrict documents to specific senders (e.g. only materials shared by `Prof. Alan`).
+   - **Date Range Filter:** Restrict documents to specific time windows using ISO dates (`YYYY-MM-DD`).
+   - **Require Linked Message:** Exclude standalone files imported without WhatsApp conversational context.
+   - **Message Keyword Filter:** Require the WhatsApp sharing message or conversation to contain specific keywords (e.g. `midterm`, `quiz`).
+3. **Strict Missing Metadata Semantics:**
+   - If a filter is active, candidate documents lacking the necessary metadata (e.g. unlinked documents or unknown senders) are excluded with explicit diagnostic reasons (`is_missing_metadata = True`). They are never silently treated as matches.
+   - Default behavior: when filters are inactive, all candidates pass through untouched.
+4. **Zero Impact on Relevance Scoring:**
+   - Conversational mentions do not artificially inflate document content relevance scores. Ranking remains anchored in document chunk text.
+5. **Local-First & Privacy Preserving:**
+   - All WhatsApp context is queried directly from local SQLite tables. Zero data is sent to external services or Gemini.
+
+---
+
+## WhatsApp Context-Aware Ranking (Phase 4, Step 4.2)
+
+### Secondary Conversational Relevance Signal
+While Step 4.1 provides metadata filtering, Step 4.2 introduces context-aware ranking: when candidate documents have comparable content relevance, the teacher's caption (e.g. *"Here is the 3NF and BCNF normalization guide for Unit 3"*) or surrounding discussion serves as a secondary relevance signal to surface the best document.
+
+### Ranking Architecture & Invariants
+1. **Content Dominance:**
+   Document content relevance from the cross-encoder (`BAAI/bge-reranker-base`) is the primary signal. WhatsApp context is secondary ($W_{\text{context}} = 0.08$). A weak content match can **never** leapfrog a strong content match solely because its caption contains query terms.
+2. **Deterministic Lexical Context Scoring:**
+   - Evaluates direct sharing message and original filename (75% weight).
+   - Evaluates surrounding 5-minute conversation window (25% weight, or discounted to 70% if no caption match).
+   - Case-insensitive, punctuation-normalized, and English stopword-filtered token overlap coverage + verbatim multi-word phrase bonus (+0.15).
+   - Bounded context score $S_{\text{context}} \in [0.0, 1.0]$.
+3. **Scale-Invariant Additive Score Combination:**
+   $$\text{Final Score} = S_{\text{content}} + W_{\text{context}} \cdot \max(\Delta_C, 1.0) \cdot S_{\text{context}}$$
+   Where $\Delta_C$ is the dynamic content score range across candidates. The boost is strictly capped to $8\%$ of the score range.
+4. **Missing Context Neutrality:**
+   Unlinked files or documents without WhatsApp context receive $S_{\text{context}} = 0.0$ and $\text{boost} = 0.0$. Their final score equals their content score with zero penalty.
+5. **Inspectable Explanations & Transparency:**
+   - Preserves original content score and original content rank alongside final score and final rank.
+   - Generates factual human-readable explanations (e.g. *"Rank improved from #2 to #1 (+0.240 context bonus from WhatsApp context matching [dbms, normalization])"*).
+   - Expandable breakdown of direct message, surrounding context, composite context scores, and matched query terms.
+6. **Resilient Fallback:**
+   If context scoring fails, the pipeline seamlessly falls back to pure content ranking without crashing.
+
+---
 
 ## Running Tests
 
-Execute the complete automated test suite using `pytest`:
+Execute the automated test suite using `pytest`:
 
 ```powershell
 pytest -v
 ```
 
+All 134+ standard unit and integration tests use deterministic mocks, requiring zero model downloads or network calls.
+
+### Running the Real-Model Smoke Test (Optional)
+To verify real model weight downloading, caching, and inference using `BAAI/bge-reranker-base`:
+
+```powershell
+$env:RUN_REAL_RERANKER_SMOKE_TEST="1"
+pytest tests/test_document_ranking.py -k "test_real_model_smoke_test" -v
+```
+
 All tests execute against temporary in-memory or isolated filesystem directories (`tmp_path`) without touching `~/.studyrag` or existing user databases.
+
 
 ---
 

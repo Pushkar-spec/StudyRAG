@@ -14,6 +14,7 @@ from core.db import (
     get_connection,
     get_file_by_id,
     get_group_files,
+    get_or_create_group,
     init_db,
 )
 from core.ingest import (
@@ -23,8 +24,10 @@ from core.ingest import (
     ingest_folder,
     ingest_zip,
     link_attachment_ref_manually,
+    normalize_input_path,
     reconcile_attachment_refs,
     recover_file_or_folder,
+    validate_recovery_target,
 )
 
 
@@ -441,3 +444,145 @@ def test_recovery_result_dataclass_contract_and_exports():
     assert res.ambiguous_references == 0
     assert res.warnings == []
     assert res.errors == []
+
+
+# ---------------------------------------------------------------------------
+# 5. Path Normalization & Attachment Recovery Regression Tests
+# ---------------------------------------------------------------------------
+
+def test_normalize_input_path_valid_absolute_file(tmp_path: Path):
+    """1. Valid absolute file path is normalized and used directly."""
+    test_file = tmp_path / "sample_doc.pdf"
+    test_file.write_bytes(b"%PDF-1.4 test")
+
+    result = normalize_input_path(str(test_file))
+    assert result == test_file.resolve()
+    assert result.is_absolute()
+    assert result.exists()
+
+
+def test_normalize_input_path_valid_absolute_folder(tmp_path: Path):
+    """2. Valid absolute folder path is normalized and used directly."""
+    test_folder = tmp_path / "downloads_folder"
+    test_folder.mkdir(parents=True, exist_ok=True)
+
+    result = normalize_input_path(str(test_folder))
+    assert result == test_folder.resolve()
+    assert result.is_absolute()
+    assert result.is_dir()
+
+
+def test_normalize_input_path_relative_against_intended_base(tmp_path: Path):
+    """3. Relative path resolves against the explicitly intended base directory."""
+    base_dir = tmp_path / "study_group_base"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    rel_path = "subfolder/exam_notes.docx"
+
+    result = normalize_input_path(rel_path, base_dir=base_dir)
+    assert result == (base_dir / "subfolder" / "exam_notes.docx").resolve()
+
+
+def test_normalize_input_path_with_spaces_and_parentheses(tmp_path: Path):
+    """4. Spaces and parentheses in filenames are strictly preserved."""
+    target_name = "Wireless Networks with MATLAB-26 (1).docx"
+    file_path = tmp_path / target_name
+    file_path.write_bytes(b"dummy docx content")
+
+    result = normalize_input_path(str(file_path))
+    assert result.name == target_name
+    assert result == file_path.resolve()
+    assert result.exists()
+
+
+def test_normalize_input_path_surrounded_by_accidental_quotes(tmp_path: Path):
+    """5. Paths surrounded by accidental matching quotes (e.g. Windows 'Copy as path') are cleanly handled."""
+    target_name = "John's Lecture Notes (2024).docx"
+    file_path = tmp_path / target_name
+    file_path.write_bytes(b"content")
+
+    # Double quotes (standard Windows 'Copy as path')
+    quoted_double = f'"{file_path}"'
+    res_double = normalize_input_path(quoted_double)
+    assert res_double == file_path.resolve()
+    assert res_double.name == target_name
+
+    # Single quotes
+    quoted_single = f"'{file_path}'"
+    res_single = normalize_input_path(quoted_single)
+    assert res_single == file_path.resolve()
+    assert res_single.name == target_name
+
+    # Whitespace around quotes
+    spaced_quoted = f'   "{file_path}"   \n'
+    res_spaced = normalize_input_path(spaced_quoted)
+    assert res_spaced == file_path.resolve()
+
+
+def test_validate_recovery_target_nonexistent_path(tmp_path: Path):
+    """6. Nonexistent paths return a clear validation error."""
+    nonexistent = tmp_path / "does_not_exist_file.pdf"
+    path, err = validate_recovery_target(str(nonexistent))
+    assert err is not None
+    assert "does not exist" in err.lower()
+    assert str(nonexistent.name) in err
+
+
+def test_recover_file_or_folder_supported_file_inside_folder(test_env: dict):
+    """7. Recovering a folder successfully imports supported files within it and resolves references."""
+    zip_p = test_env["tmp_path"] / "folder_rec.zip"
+    files = {
+        "_chat.txt": "12/03/24, 10:15 am - Prof. Alan: <attached: Lab_Manual.docx> Unit lab manual\n",
+    }
+    create_zip(zip_p, files)
+
+    ingest_res = ingest_zip(zip_p, "LabGroup", db_path=test_env["db_path"], data_dir=test_env["data_dir"])
+    assert ingest_res.missing_attachments_count == 1
+
+    recovery_folder = test_env["tmp_path"] / "recovered_folder"
+    recovery_folder.mkdir(parents=True, exist_ok=True)
+    (recovery_folder / "Lab_Manual.docx").write_bytes(b"docx content here")
+    (recovery_folder / "Extra_Reference.pdf").write_bytes(b"%PDF-1.4 extra content")
+    (recovery_folder / "ignore.exe").write_bytes(b"binary data")
+
+    rec_res = recover_file_or_folder(
+        target_path=recovery_folder,
+        group_id=ingest_res.group_id,
+        db_path=test_env["db_path"],
+        data_dir=test_env["data_dir"],
+    )
+
+    assert len(rec_res.imported_files) == 2  # Lab_Manual.docx and Extra_Reference.pdf
+    assert rec_res.remaining_missing == 0
+    refs = get_attachment_refs(group_id=ingest_res.group_id, status="available", db_path=test_env["db_path"])
+    assert len(refs) == 1
+    assert refs[0]["original_filename"] == "Lab_Manual.docx"
+
+
+def test_validate_recovery_target_unsupported_file_type(tmp_path: Path):
+    """8. Files with unsupported extensions return a clear validation error."""
+    unsupported_file = tmp_path / "notes.exe"
+    unsupported_file.write_bytes(b"executable data")
+
+    path, err = validate_recovery_target(str(unsupported_file))
+    assert err is not None
+    assert "unsupported extension '.exe'" in err
+    assert "Supported file types:" in err
+
+
+def test_regression_project_directory_not_prepended_to_absolute_path():
+    """9. Regression test confirming project directory is not prepended to an absolute Windows path."""
+    raw_quoted_win_path = r'"C:\Users\pushk\Downloads\Wireless Networks with MATLAB-26 (1).docx"'
+    raw_unquoted_win_path = r'C:\Users\pushk\Downloads\Wireless Networks with MATLAB-26 (1).docx'
+
+    norm_quoted = normalize_input_path(raw_quoted_win_path)
+    norm_unquoted = normalize_input_path(raw_unquoted_win_path)
+
+    expected_path = Path(r"C:\Users\pushk\Downloads\Wireless Networks with MATLAB-26 (1).docx").resolve()
+
+    assert norm_quoted == expected_path
+    assert norm_unquoted == expected_path
+
+    # Verify that cwd / project directory is NOT prepended
+    cwd_str = str(Path.cwd().resolve())
+    assert not str(norm_quoted).startswith(cwd_str + "\\")
+    assert not str(norm_quoted).startswith(cwd_str + "/")

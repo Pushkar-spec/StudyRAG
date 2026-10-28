@@ -328,3 +328,205 @@ Ensure SQLite schema initialization via `init_db()` strictly executes operations
 
 ### Rationale
 In earlier versions, `INDEX_STATEMENTS` ran prior to additive migrations. When StudyRAG started on an existing database created prior to Step 2.1, SQLite raised `sqlite3.OperationalError: no such column: chunk_index` during index creation. Enforcing strict DDL ordering and deterministic backfill eliminates migration crashes and preserves all existing user document records.
+
+---
+
+## 23. Primitive Widget Options & Section-Level Resilience in Streamlit UI
+
+### Decision
+1. **No SQLite Row Objects in Widget State:** Streamlit widgets (such as `st.selectbox`) store chosen option values in `st.session_state` and perform internal serialization / copying. Because standard library `sqlite3.Row` objects cannot be pickled (`TypeError: cannot pickle 'sqlite3.Row' object`), raw SQLite rows must never be passed as widget options.
+2. **Boundary Object Conversion:** All database queries return results that are converted into standard Python dictionaries (`dict(row)`) or primitive identifiers (`int`, `str`) at the UI boundary.
+3. **Primitive Identifiers for Options:** Group and reference selection widgets use stable primitive IDs (`int | None`) as option values, using `format_func` or dictionary lookups to display human-readable labels (e.g. `format_func=lambda gid: f"{name} (ID: {gid})"`).
+4. **Section-Level Failure Isolation:** In `main()`, independent workflow sections (`render_ingestion_preview`, `render_attachment_recovery`, `render_document_processing`, `render_vector_indexing_and_search`) are wrapped in diagnostic error-handling blocks. An unexpected runtime error in one section reports a clear diagnostic alert via `st.error` without crashing the application or preventing subsequent sections from rendering.
+
+---
+
+## 24. Safe Windows Path Normalization for Attachment Ingestion & Recovery
+
+### Decision
+Implement centralized path normalization (`core.ingest.normalize_input_path`) and target validation (`core.ingest.validate_recovery_target`) for all user-entered filesystem paths across ingestion and recovery:
+1. **Handling Windows Copy-as-Path Quotes:** Windows Explorer's "Copy as path" encloses paths in double quotes (e.g. `"C:\Users\...\file.docx"`). Because `"` is an invalid character in NTFS/FAT paths, Python's `Path` treats a leading `"` as a relative path component, incorrectly prepending the project working directory (`C:\Users\pushk\Desktop\StudyRAG\...`). The helper cleans surrounding and accidental single and double quotes without corrupting legitimate apostrophes or spaces within filenames.
+2. **Absolute vs Relative Path Guarantees:** Absolute Windows drive paths (`C:\...` or `C:/...`) and UNC network paths (`\\server\share\...`) are recognized and resolved directly without directory concatenation. Relative paths resolve strictly against an explicitly intended base directory.
+3. **Pre-Recovery Validation:** Validates existence, regular file vs folder status, and supported study document extensions (`.pdf`, `.pptx`, `.docx`, `.jpg`, `.jpeg`, `.png`) before attempting recovery, returning clear user-facing diagnostics instead of cryptic OS or path errors.
+
+---
+
+## 25. Local Cross-Encoder Reranking (`BAAI/bge-reranker-base`) & Bounded Document Aggregation (Step 3.2)
+
+### Context & Problem
+In Step 2.2, StudyRAG established hybrid retrieval combining SQLite FTS5 lexical BM25 matching and ChromaDB cosine dense retrieval. However:
+1. **Bi-encoder Limitations:** Bi-encoders (`BAAI/bge-small-en-v1.5`) independently project queries and passages into dense vectors. While fast for vector search across thousands of chunks, independent encoding misses deep cross-attention interactions, negation, and complex relational nuances between query terms and text passages.
+2. **Chunk vs Document Retrieval:** Students search for authoritative documents (e.g., lecture note, tutorial sheet, assignment), not disconnected chunks in isolation. If multiple chunks from a single document are retrieved, simply returning raw chunks fragments the user's view.
+3. **Score Inflation Risk:** Naive aggregation (such as summing chunk scores across a document) artificially favors large, verbose textbooks over concise, highly relevant hand-outs or slides.
+
+### Decisions
+
+#### 1. Separation of Bi-Encoder Retrieval and Cross-Encoder Reranking
+- **Bi-Encoder (`BAAI/bge-small-en-v1.5`):** Used strictly for fast candidate retrieval ($K \approx 20\text{--}50$ chunks) in vector space.
+- **Cross-Encoder (`BAAI/bge-reranker-base`):** Evaluates candidate pairs jointly through full transformer self-attention layers: $\text{CrossEncoder}([\text{query}, \text{chunk\_text}])$.
+- **Strict Separation:** The embedding model and reranker configurations are isolated. Embeddings are never overwritten by reranker scores, and the reranker is not substituted for vector search.
+
+#### 2. Lazy Singleton Loading, Local Cache & Hardware Portability
+- **Manager Singleton (`LocalRerankerManager`):** The cross-encoder is loaded lazily on demand when a search requiring reranking is executed. The model is cached in process memory and reused across subsequent searches, avoiding model reloads during Streamlit script reruns.
+- **Local Cache:** Model weights are downloaded directly from Hugging Face hub on first invocation and cached in the standard cache directory (`~/.cache/huggingface/hub/models--BAAI--bge-reranker-base`). No Hugging Face inference API, tokens, or external API keys are required.
+- **Device Support:** Automatically selects `cuda` if compatible and available; otherwise defaults gracefully to `cpu`. Configurable via `rerank_device`.
+
+#### 3. Bounded, Non-Inflationary Document-Level Score Aggregation
+Candidate chunks are grouped by original `file_id`. Document relevance is computed using a deterministic, bounded aggregation formula:
+$$\text{Document Score} = s_1 + \sum_{i=2}^{\min(N, 4)} w_i \cdot \max(0.0, s_i)$$
+Where:
+- $s_1$: The highest reranker score among candidate chunks for the document (primary relevance signal).
+- $s_2, s_3, s_4$: Secondary distinct candidate chunks, contributing with bounded diminishing weights $w = [0.10, 0.05, 0.02]$ (maximum cumulative bonus of $\le 17\%$ of chunk relevance).
+- **Near-Duplicate Suppression:** Chunks sharing high token overlap (Jaccard similarity $\ge 0.60$ over lowercase word tokens) are flagged as near-duplicates and awarded zero bonus. Repeated boilerplate or identical headings cannot inflate document scores.
+- **Non-Negative Safeguard:** $\max(0.0, s_i)$ ensures negative model scores never contribute positive bonuses.
+- **Length Neutrality:** A document with 100 chunks cannot dominate over a 2-page document solely by volume. The primary chunk anchors the score.
+
+#### 4. Model Score Semantics & Limitations
+- Cross-encoder scores are raw unbounded model logits, not probabilities or calibrated percentages.
+- Scores reflect relative ordering rather than absolute confidence. They are labeled in the UI as "Model Score" rather than "Confidence %" to prevent misleading users.
+
+#### 5. Graceful Degradation & Hybrid Fallback
+- If the reranker model is disabled (`disable_reranker=True`), encounters an initialization failure, or raises an inference error, the pipeline immediately falls back to hybrid candidate ordering without discarding search results.
+- Documents are aggregated using best retrieval signals (`both` consensus hits ranked first, followed by highest semantic similarity or inverse BM25 rank).
+- The result is explicitly marked with `is_reranked = False` and includes descriptive diagnostic messages detailing the fallback reason.
+
+#### 6. Dual-Mode Testing Strategy
+- **Standard Unit/Integration Tests:** Use deterministic mock cross-encoders (`MockReranker`) to test pair construction, rank assignment, metadata preservation, score deduplication, and aggregation without downloading model weights or making network calls.
+- **Real-Model Smoke Test:** An isolated smoke test (`test_real_model_smoke_test`) gated by the environment variable `RUN_REAL_RERANKER_SMOKE_TEST="1"` downloads and verifies real model inference on synthetic query-passage pairs.
+
+---
+
+## 26. Disabling Streamlit File Watcher (`fileWatcherType = "none"`) & Model Lifecycle
+
+### Context & Problem
+During Streamlit operation, the terminal emitted repeated warnings:
+```text
+streamlit.watcher.local_sources_watcher - ModuleNotFoundError: No module named 'torchvision'
+```
+Furthermore, application reloads exhibited severe delays (10–20+ seconds per interaction). Investigation revealed two interrelated causes:
+1. **Module Hierarchy Traversal & Optional Dependencies:** Streamlit's `LocalSourcesWatcher` inspects `sys.modules` to register file watchers. When inspecting `transformers` submodules (e.g. image processing utilities), dynamic attribute access attempts to conditionally import `torchvision`. Because StudyRAG processes text documents (PDF, PPTX, DOCX) and uses text-based models (`bge-small-en-v1.5`, `bge-reranker-base`), `torchvision` is neither installed nor required. The watcher catches the exception and logs it as a warning.
+2. **Aggressive Module Eviction on Windows:** On detected filesystem events, `LocalSourcesWatcher` flushes watched modules from `sys.modules`. This evicted `core.vector_store` and `core.reranker`, discarding in-memory singleton model references (`_cached_model`) and forcing expensive module re-execution and model weight reloading into PyTorch. In addition, recursively scanning thousands of package files across `site-packages` on Windows NTFS introduced substantial disk I/O latency.
+
+### Decision
+1. **Disable File Watching in `.streamlit/config.toml`:**
+   Configured `[server] fileWatcherType = "none"`. This disables `LocalSourcesWatcher` and its recursive module/file-tree inspection.
+2. **Developer Workflow Trade-off:**
+   Code modifications now require manually stopping and restarting `streamlit run app.py` rather than relying on automatic file-change reloads.
+3. **Preserve Clean Model Singleton Caching:**
+   - Embeddings (`LocalEmbeddingManager` in `core.vector_store`) and cross-encoder rerankers (`LocalRerankerManager` in `core.reranker`) persist model weights in process memory across user interactions and Streamlit script reruns.
+   - Model loading is lazy: embeddings load upon the first vector indexing/search request, and the reranker loads strictly upon the first cross-encoder reranking request.
+   - Device auto-resolution (`cuda` if available and compatible, otherwise `cpu`) and local Hugging Face caching (`~/.cache/huggingface/hub/`) remain preserved.
+4. **No Unnecessary Dependencies:**
+   `torchvision` is intentionally omitted because StudyRAG's extraction, embedding, and reranking pipelines are strictly text-based.
+
+---
+
+## 27. WhatsApp Conversational Context Retrieval & Filtering Architecture (Step 4.1)
+
+### Context & Objective
+Documents imported into StudyRAG frequently originate from WhatsApp study groups, where academic materials are distributed alongside conversational messages, sender information, timestamps, and surrounding discussion.
+The goal of Step 4.1 is to surface this rich conversational provenance for search candidate documents and provide optional metadata filtering (group, sender, date range, message text, and linked status) without altering relevance ranking scores, without triggering external API calls (Gemini), and without reparsing raw ZIP exports during search.
+
+### Design Principles & Decisions
+
+#### 1. Zero Schema Migrations & Storage Reuse
+- Analysis of the existing SQLite database schema revealed that `attachment_refs`, `files`, `groups`, and `senders` already retain all required metadata:
+  - `attachment_refs.caption`: Direct WhatsApp message accompanying an attachment.
+  - `attachment_refs.context`: Surrounding conversational window (up to 3 preceding messages from the sender within 5 minutes).
+  - `attachment_refs.file_id`: Foreign key linking the WhatsApp message to the registered file.
+  - `attachment_refs.status` & `resolution_method`: Provenance tracking for direct, SHA-256, filename, or manual recovery.
+  - `files.sender`, `files.sent_at`, `files.caption`: First-class file metadata populated during ingestion.
+- **Decision:** No SQLite schema modifications or migrations were made. All conversational context is queried directly from existing tables using parameterized joins.
+
+#### 2. Read-Only, Bounded SQLite Context Retrieval
+- Context retrieval is implemented in `core.whatsapp_context` via `get_whatsapp_context_for_documents()` and in `core.db` via `get_files_whatsapp_context()`.
+- Retrieval is strictly read-only and queries SQLite using indexed file IDs (`file_id IN (...)`).
+- Zero ZIP traversal or text reparsing is performed at query time. Context lookups take $< 2$ milliseconds.
+- Multiple sharing messages for a single file (e.g. if the same PDF was shared twice across discussions) are captured and aggregated into `all_messages`, with the highest-fidelity reference designated as `primary_message`.
+- Standalone files imported without WhatsApp exports cleanly return `has_linked_message = False` with `None` sender, timestamp, and group attributes.
+
+#### 3. Strict Separation of Relevance Scoring and Conversational Provenance
+- A WhatsApp message mentioning an exam topic does **not** automatically make the attached document semantically relevant to the user's query.
+- Document ranking scores are derived exclusively from document text chunks via hybrid search (FTS5 BM25 + ChromaDB cosine similarity) and the local cross-encoder (`BAAI/bge-reranker-base`).
+- WhatsApp context retrieval runs *after* document-level aggregation. Filtering acts as a post-aggregation filter that respects user constraints without distorting model logit scores.
+
+#### 4. Filter Semantics & Missing Metadata Handling
+- Supported filters via `WhatsAppFilterCriteria`:
+  - `group_ids: list[int] | None`: Include documents from specified group(s).
+  - `senders: list[str] | None`: Include documents shared by specified sender(s).
+  - `date_from: str | None` & `date_to: str | None`: ISO date / timestamp range filter (`YYYY-MM-DD`).
+  - `has_linked_message: bool | None`: When `True`, requires a confirmed WhatsApp sharing message.
+  - `message_query: str | None`: Substring search in direct caption or surrounding conversation window.
+- **Missing Metadata Policy:** If a filter is explicitly enabled, documents lacking the required metadata (e.g. unlinked documents or records where sender/timestamp is unknown) are **excluded** with an explicit diagnostic flag (`is_missing_metadata = True`) and a clear diagnostic explanation. They are **never** silently treated as matching.
+- **Default Behavior:** All filters default to `None` (disabled). When disabled, every candidate document passes through, preserving exact Step 3.2 search behavior.
+- **Rank Re-assignment:** If candidate documents are excluded by active filters, surviving documents are re-indexed with sequential ranks ($1, 2, \dots$) so the user always sees clean rank ordering.
+
+#### 5. Privacy & Local Execution
+- All message context, sender names, and timestamps remain strictly local within SQLite.
+- Context retrieval and filtering perform zero network requests and do not communicate with Gemini or external endpoints.
+- WhatsApp message inspection is provided via a collapsible drawer in the Streamlit UI, allowing users to inspect conversational context without visual clutter.
+
+---
+
+## 28. WhatsApp Context-Aware Ranking Strategy & Conservative Score Combination (Step 4.2)
+
+### Context & Objective
+In Step 4.1, StudyRAG introduced conversational context retrieval and metadata filtering. However, metadata filtering acts strictly as an eligibility gate.
+When multiple documents are eligible, the conversational provenance accompanying a document (such as an instructor's message *"Here is the 3NF and BCNF normalization guide for Unit 3"*) provides valuable supplementary relevance evidence that can help resolve close results between candidate documents.
+
+The objective of Step 4.2 is to introduce a secondary relevance signal derived from WhatsApp sharing messages and conversational context, while ensuring that document content relevance remains primary and is never overpowered.
+
+### Design Principles & Decisions
+
+#### 1. Separation of Document Content Relevance, Context Relevance, and Metadata Eligibility
+- **Document Content Relevance (Primary):** Anchored in the document text itself, evaluated via hybrid retrieval (FTS5 BM25 + ChromaDB cosine similarity) and local cross-encoder reranking (`BAAI/bge-reranker-base`).
+- **Conversational Context Relevance (Secondary):** Evaluates how closely the user's query aligns with the direct WhatsApp sharing message and surrounding conversational window.
+- **Metadata Filters (Step 4.1):** Evaluate whether a document is eligible to be considered based on user constraints (group, sender, date range, linked status). Filters are applied strictly *before* context-aware ranking; an ineligible document is excluded regardless of its context relevance score.
+
+#### 2. Local Deterministic Lexical Context Scoring
+- Implemented in `core.context_ranking.score_whatsapp_context()`:
+  - **Normalization:** Queries and context texts are lowercased and stripped of punctuation. Standard English stopwords (e.g. *on, in, of, at, for*) are filtered to prevent uninformative matching.
+  - **Duplicate Token Safety:** Query terms are deduplicated so repeating terms in the query does not artificially inflate match counts.
+  - **Coverage & Phrase Matching:** Evaluates token overlap coverage against text tokens, awarding an exact multi-word phrase bonus (+0.15) when the query occurs verbatim.
+  - **Separation of Direct vs Surrounding Signals:**
+    - Direct sharing message / caption and attachment filename carry primary authority ($0.75$ weight).
+    - Surrounding conversation window (5-minute context) provides conversational background ($0.25$ weight).
+    - If only surrounding conversation exists (e.g. document uploaded with no caption, but discussed immediately prior), it carries a $0.70$ discount factor relative to direct captions.
+  - **Bounded Context Score:** The composite context score $S_{\text{context}}$ is strictly bounded in $[0.0, 1.0]$.
+  - **Zero External Calls:** Purely local lexical computation with zero external network requests, zero Gemini API calls, and zero additional neural model downloads.
+
+#### 3. Conservative Score Combination Formula & Guarantees
+Cross-encoder scores are raw real-valued logits (typically in range $[-6.0, +8.0]$), whereas context scores are bounded in $[0.0, 1.0]$. Directly adding raw numbers together would distort ranking across queries with differing logit spreads.
+StudyRAG adopts a scale-invariant, bounded additive boost formula:
+
+$$\Delta_C = \max\left(\max_{d \in D} C(d) - \min_{d \in D} C(d), 1.0\right)$$
+$$\text{boost}(d) = W_{\text{context}} \cdot \Delta_C \cdot S_{\text{context}}(d)$$
+$$\text{Final Score}(d) = C(d) + \text{boost}(d)$$
+
+Where:
+- $C(d)$: Authoritative document content score from cross-encoder reranking (or hybrid fallback).
+- $\Delta_C$: Dynamic content score range across eligible candidate documents.
+- $W_{\text{context}}$: Conservative context influence weight (default: $0.08$, configurable up to $0.50$).
+- $S_{\text{context}}(d)$: Bounded composite context relevance score in $[0.0, 1.0]$.
+
+**Guarantees & Invariants:**
+1. **Content Dominance:** The maximum boost any document can ever receive is $W_{\text{context}} \cdot \Delta_C = 0.08 \cdot \Delta_C$. A document with weak content relevance (e.g. logit 0.5 vs top candidate logit 4.0, deficit of 3.5) can never leapfrog the top candidate even if its caption is a 100% perfect match.
+2. **Close Result Resolution:** When two candidates have comparable content scores (e.g. $3.20$ vs $3.16$), a matching WhatsApp caption provides a decisive nudge to surface the more contextually relevant document.
+3. **Missing Context Neutrality:** If a document has no linked WhatsApp message or its context does not match the query, $S_{\text{context}} = 0.0 \implies \text{boost} = 0.0 \implies \text{Final Score} = C(d)$. Documents without WhatsApp context suffer zero penalty.
+4. **Deterministic Tie-Breaking:** If two documents have identical final scores, ties are resolved deterministically by:
+   `(-final_score, -content_score, -chunk_count, file_id)`.
+
+#### 4. Transparent Inspectability & Explanations
+- The `RankedDocument` data structure preserves both:
+  - `content_score` & `content_rank`: Original content relevance from Step 3.2.
+  - `document_score` & `rank`: Final context-adjusted score and sequential rank.
+- Each document includes a human-readable `adjustment_explanation`:
+  - E.g.: *"Rank improved from #2 to #1 (+0.240 context bonus from WhatsApp context matching [dbms, normalization])."*
+  - Or: *"Ranked by document content relevance alone (no linked WhatsApp sharing message)."*
+- The Streamlit UI displays original vs adjusted scores, rank shifts, and an expandable breakdown of direct caption, surrounding conversation, and composite context scores.
+
+#### 5. Resilient Fallback Strategy
+- If context retrieval or context scoring encounters an unexpected error:
+  - The pipeline catches the error and falls back immediately to pure content ranking.
+  - Diagnostic warnings are recorded in `SearchRankedResult.diagnostics`.
+  - Content-based candidate search results and cross-encoder scores are 100% preserved.

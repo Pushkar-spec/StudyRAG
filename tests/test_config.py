@@ -28,6 +28,11 @@ def test_default_settings_valid():
     assert s.gemini_model == "gemini-2.5-flash-lite"
     assert s.embed_model == "BAAI/bge-small-en-v1.5"
     assert s.rerank_model == "BAAI/bge-reranker-base"
+    assert s.rerank_top_k == 20
+    assert s.rerank_device == ""
+    assert s.disable_reranker is False
+    assert s.context_ranking_weight == 0.08
+    assert s.disable_context_ranking is False
     assert s.strictness == 0.5
     assert s.use_gemini_grading is True
     assert s.daily_token_cap == 100000

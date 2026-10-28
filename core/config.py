@@ -46,6 +46,29 @@ class Settings(BaseModel):
         default="BAAI/bge-reranker-base",
         description="Reranker model identifier for candidate relevance ranking.",
     )
+    rerank_top_k: int = Field(
+        default=20,
+        ge=1,
+        description="Maximum candidate chunks to rerank per query.",
+    )
+    rerank_device: str = Field(
+        default="",
+        description="Device for reranker inference ('cpu', 'cuda', or empty string for auto-detect).",
+    )
+    disable_reranker: bool = Field(
+        default=False,
+        description="Whether to disable local cross-encoder reranking and use hybrid fallback.",
+    )
+    context_ranking_weight: float = Field(
+        default=0.08,
+        ge=0.0,
+        le=0.5,
+        description="Weight for secondary WhatsApp context relevance scoring (0.0 to 0.5).",
+    )
+    disable_context_ranking: bool = Field(
+        default=False,
+        description="Whether to disable WhatsApp context-aware ranking adjustments.",
+    )
 
     # Retrieval & grading parameters
     strictness: float = Field(

@@ -50,9 +50,11 @@ __all__ = [
     "link_attachment_ref_manually",
     "link_files_to_chat",
     "normalize_filename",
+    "normalize_input_path",
     "reconcile_attachment_refs",
     "recover_file_or_folder",
     "sanitize_filename",
+    "validate_recovery_target",
 ]
 
 # Supported document and image file extensions
@@ -122,6 +124,85 @@ def normalize_filename(name: str | None) -> str:
     clean = unicodedata.normalize("NFKC", name.strip())
     clean = clean.replace("\\", "/")
     return Path(clean).name.lower()
+
+
+def normalize_input_path(raw_path: str | Path, base_dir: Path | str | None = None) -> Path:
+    """Safely normalize and resolve a user-entered file or folder path.
+
+    Handles:
+    - Stripping leading and trailing whitespace.
+    - Stripping matching accidental surrounding single or double quotes (e.g. from Windows 'Copy as path').
+    - Direct usage of absolute Windows paths without prepending project directory.
+    - Resolution of relative paths against the explicitly intended base directory.
+    - Preservation of spaces, parentheses, accents, and legitimate characters in filenames.
+    """
+    if isinstance(raw_path, Path):
+        s = str(raw_path)
+    else:
+        s = str(raw_path) if raw_path is not None else ""
+
+    s = s.strip()
+    if not s:
+        raise ValueError("Path cannot be empty.")
+
+    # Remove matching surrounding single quotes
+    if len(s) >= 2 and s.startswith("'") and s.endswith("'"):
+        s = s[1:-1].strip()
+
+    # Remove matching surrounding double quotes
+    if len(s) >= 2 and s.startswith('"') and s.endswith('"'):
+        s = s[1:-1].strip()
+
+    # Double quotes are never valid in Windows paths or filenames.
+    # Safely strip any stray leading/trailing double quotes from copy-paste glitches:
+    s = s.strip('"').strip()
+
+    # Re-check single quotes if they were wrapped inside double quotes
+    if len(s) >= 2 and s.startswith("'") and s.endswith("'"):
+        s = s[1:-1].strip()
+
+    if not s:
+        raise ValueError("Path cannot be empty.")
+
+    p = Path(s)
+    # Check absolute: standard is_absolute() or Windows drive letter pattern (e.g. C:\ or C:/)
+    is_win_drive = bool(re.match(r"^[a-zA-Z]:[\\/]", s))
+    if p.is_absolute() or is_win_drive:
+        return p.resolve()
+
+    base = Path(base_dir).resolve() if base_dir is not None else Path.cwd().resolve()
+    return (base / p).resolve()
+
+
+def validate_recovery_target(
+    target_path: Path | str,
+    base_dir: Path | str | None = None,
+) -> tuple[Path, str | None]:
+    """Validate whether target_path exists, is accessible, and is a supported file or folder.
+
+    Returns:
+        (resolved_path, error_message).
+        error_message is None if the path exists and is a supported file or directory.
+    """
+    try:
+        path = normalize_input_path(target_path, base_dir=base_dir)
+    except Exception as err:
+        return Path(str(target_path)), f"Invalid path: {err}"
+
+    if not path.exists():
+        return path, f"Path does not exist: '{path}'"
+
+    if path.is_file():
+        ext = path.suffix.lower()
+        if ext not in SUPPORTED_EXTENSIONS:
+            allowed = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+            return path, f"File '{path.name}' has unsupported extension '{ext}'. Supported file types: {allowed}"
+        return path, None
+
+    if path.is_dir():
+        return path, None
+
+    return path, f"Path is not a regular file or directory: '{path}'"
 
 
 def compute_sha256(file_path: Path) -> str:
@@ -424,7 +505,7 @@ def ingest_zip(
     if not clean_group:
         raise ValueError("Group name cannot be empty")
 
-    source_zip = Path(zip_path).resolve()
+    source_zip = normalize_input_path(zip_path)
     if not source_zip.exists():
         raise FileNotFoundError(f"ZIP file not found at '{source_zip}'")
 
@@ -603,7 +684,7 @@ def ingest_folder(
     if not clean_group:
         raise ValueError("Group name cannot be empty")
 
-    source_dir = Path(folder_path).resolve()
+    source_dir = normalize_input_path(folder_path)
     if not source_dir.exists() or not source_dir.is_dir():
         raise FileNotFoundError(f"Folder not found at '{source_dir}'")
 
@@ -821,7 +902,7 @@ def recover_file_or_folder(
     Idempotently registers new files, preserves original files, and reconciles
     unresolved attachment references in the specified group.
     """
-    path_obj = Path(target_path).resolve()
+    path_obj = normalize_input_path(target_path)
     if not path_obj.exists():
         raise FileNotFoundError(f"Recovery target path does not exist: '{path_obj}'")
 
